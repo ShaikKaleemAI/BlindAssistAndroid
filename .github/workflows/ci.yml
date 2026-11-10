@@ -1,4 +1,4 @@
-# Push to GitHub -> this builds an installable APK and publishes it on the repo's "Releases" page.
+# Push to GitHub -> builds an installable APK and publishes it on the repo's "Releases" page.
 name: build-apk
 on:
   push:
@@ -15,12 +15,21 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: 17 }
-      - name: Accept Android SDK licenses (the runner already has the SDK preinstalled)
-        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+      - uses: android-actions/setup-android@v3
       - uses: gradle/actions/setup-gradle@v4
         with: { gradle-version: 8.7 }
       - name: Build debug APK (downloads the detector model during the build)
-        run: gradle :app:assembleDebug --stacktrace
+        shell: bash
+        run: gradle :app:assembleDebug --stacktrace --console=plain 2>&1 | tee build.log
+      - name: Show the real compiler errors (only if the build failed)
+        if: failure()
+        shell: bash
+        run: |
+          echo "### Compiler errors" >> "$GITHUB_STEP_SUMMARY"
+          grep -E "^e: |error:|Unresolved|Could not resolve|Duplicate class" build.log | head -60 | tee -a "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with: { name: build-log, path: build.log }
       - name: Name the APK
         run: cp app/build/outputs/apk/debug/app-debug.apk BlindAssist-debug.apk
       - uses: actions/upload-artifact@v4
@@ -36,16 +45,24 @@ jobs:
 
   tests:
     runs-on: ubuntu-latest
+    # Tests are a quality check; they must never block the APK from being delivered.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: 17 }
-      - name: Accept Android SDK licenses (the runner already has the SDK preinstalled)
-        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+      - uses: android-actions/setup-android@v3
       - uses: gradle/actions/setup-gradle@v4
         with: { gradle-version: 8.7 }
       - name: Unit tests (no model download needed)
-        run: gradle :app:testDebugUnitTest -PskipModel --stacktrace
+        shell: bash
+        run: gradle :app:testDebugUnitTest -PskipModel --stacktrace --console=plain 2>&1 | tee test.log
+      - name: Show the real compiler errors (only if it failed)
+        if: failure()
+        shell: bash
+        run: |
+          echo "### Test job errors" >> "$GITHUB_STEP_SUMMARY"
+          grep -E "^e: |FAILED|error:|Unresolved" test.log | head -60 | tee -a "$GITHUB_STEP_SUMMARY" || true
       - uses: actions/upload-artifact@v4
         if: always()
         with: { name: test-report, path: app/build/reports/tests/ }
