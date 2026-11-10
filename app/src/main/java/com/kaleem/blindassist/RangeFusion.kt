@@ -49,7 +49,8 @@ fun estimateRange(label: String, box: DoubleArray, fw: Double, fh: Double, cam: 
                 if (z < 30) cands += Cand(z, sigma, "ground")
             }
         } else {
-            cam.groundZ(uc, fh - 1, fw, fh, pitch)?.let { bounds += it }
+            val zb = cam.groundZ(uc, fh - 1, fw, fh, pitch)
+            if (zb != null) bounds.add(zb)
             flags += "clipped_bottom"
         }
     }

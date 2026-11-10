@@ -40,67 +40,93 @@ class ReplayRunner(private val ctx: Context, private val detector: FrameDetector
     fun run(uri: Uri, tag: String, onProgress: (done: Int, total: Int) -> Unit): ReplaySummary {
         val mmr = MediaMetadataRetriever()
         try {
-            mmr.setDataSource(ctx, uri)
-            val durMs = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
-            val total = ceil(durMs / 1000.0 * cfg.sampleFps).toInt().coerceAtLeast(1)
-            val dir = File(ctx.getExternalFilesDir(null) ?: ctx.filesDir, "replay").apply { mkdirs() }
-            val base = "${tag}_${System.currentTimeMillis()}"
-            val fFrames = File(dir, "${base}_frames.csv")
-            val fEvents = File(dir, "${base}_events.csv")
-            val fDets = File(dir, "${base}_dets.csv")
-
-            val pipe = Pipeline(Cam(cfg.hfovDeg, cfg.camHeightM, cfg.pitchDeg), Cfg.lang)
-            val procMs = ArrayList<Double>()
-            var speech = 0; var beeps = 0; var vibes = 0; var frames = 0
-            val step = 1.0 / cfg.sampleFps
-            val l = Locale.US
-
-            fFrames.bufferedWriter().use { wf ->
-                fEvents.bufferedWriter().use { we ->
-                    fDets.bufferedWriter().use { wd ->
-                        wf.write("t_video_s,proc_ms,n_dets,n_tracks\n")
-                        we.write("t_video_s,kind,priority,text\n")
-                        wd.write("t_video_s,label,conf,x1,y1,x2,y2,z_m,bearing_deg,flags\n")
-                        var i = 0
-                        while (!cancelled) {
-                            val tVid = i * step
-                            i++
-                            if (tVid * 1000.0 > durMs) break
-                            val raw = mmr.getFrameAtTime((tVid * 1_000_000.0).toLong(), MediaMetadataRetriever.OPTION_CLOSEST)
-                                ?: continue
-                            val t0 = SystemClock.elapsedRealtimeNanos()
-                            val bmp = prepare(raw)
-                            val dets = detector.detect(bmp)
-                            val evs = pipe.process(dets, tVid, bmp.width.toDouble(), bmp.height.toDouble(), cfg.pitchDeg)
-                            val ms = (SystemClock.elapsedRealtimeNanos() - t0) / 1e6
-                            procMs += ms; frames++
-                            wf.write(String.format(l, "%.3f,%.1f,%d,%d\n", tVid, ms, dets.size, pipe.lastTracks.size))
-                            for (d in dets) {
-                                val e = d.est
-                                wd.write(String.format(l, "%.3f,%s,%.2f,%.0f,%.0f,%.0f,%.0f,%s,%s,%s\n", tVid, d.label, d.conf,
-                                    d.box[0], d.box[1], d.box[2], d.box[3],
-                                    if (e != null) String.format(l, "%.2f", e.z) else "",
-                                    if (e != null) String.format(l, "%.1f", e.bearing) else "",
-                                    if (e != null) e.flags.joinToString("|") else "no_range"))
-                            }
-                            for (ev in evs) when (ev) {
-                                is Ev.Speech -> { speech++; we.write(String.format(l, "%.3f,speech,%d,%s\n", tVid, ev.pri, csvEscape(ev.text))) }
-                                is Ev.Beep -> { beeps++; we.write(String.format(l, "%.3f,beep,,%s\n", tVid, csvEscape(String.format(l, "pan=%.2f freq=%.0f", ev.pan, ev.freq)))) }
-                                Ev.Vibrate -> { vibes++; we.write(String.format(l, "%.3f,vibrate,,\"\"\n", tVid)) }
-                            }
-                            if (frames % 5 == 0) onProgress(frames, total)
-                        }
-                    }
-                }
-            }
-            onProgress(frames, total)
-            val sorted = procMs.sorted()
-            val p95 = if (sorted.isEmpty()) 0.0 else sorted[(ceil(0.95 * sorted.size).toInt() - 1).coerceIn(0, sorted.size - 1)]
-            return ReplaySummary(frames, speech, beeps, vibes, if (procMs.isEmpty()) 0.0 else procMs.average(), p95,
-                listOf(fFrames, fEvents, fDets))
+            return runWith(mmr, uri, tag, onProgress)
         } finally {
             try { mmr.release() } catch (ignored: Exception) {}
         }
+    }
+
+    private fun runWith(
+        mmr: MediaMetadataRetriever, uri: Uri, tag: String, onProgress: (done: Int, total: Int) -> Unit
+    ): ReplaySummary {
+        mmr.setDataSource(ctx, uri)
+        val durMs = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+        val total = ceil(durMs / 1000.0 * cfg.sampleFps).toInt().coerceAtLeast(1)
+        val dir = File(ctx.getExternalFilesDir(null) ?: ctx.filesDir, "replay")
+        dir.mkdirs()
+        val base = tag + "_" + System.currentTimeMillis()
+        val fFrames = File(dir, base + "_frames.csv")
+        val fEvents = File(dir, base + "_events.csv")
+        val fDets = File(dir, base + "_dets.csv")
+
+        val pipe = Pipeline(Cam(cfg.hfovDeg, cfg.camHeightM, cfg.pitchDeg), Cfg.lang)
+        val procMs = ArrayList<Double>()
+        var speech = 0
+        var beeps = 0
+        var vibes = 0
+        var frames = 0
+        val step = 1.0 / cfg.sampleFps
+        val l = Locale.US
+
+        val wf = fFrames.bufferedWriter()
+        val we = fEvents.bufferedWriter()
+        val wd = fDets.bufferedWriter()
+        try {
+            wf.write("t_video_s,proc_ms,n_dets,n_tracks\n")
+            we.write("t_video_s,kind,priority,text\n")
+            wd.write("t_video_s,label,conf,x1,y1,x2,y2,z_m,bearing_deg,flags\n")
+            var i = 0
+            while (!cancelled) {
+                val tVid = i * step
+                i++
+                if (tVid * 1000.0 > durMs) break
+                val raw = mmr.getFrameAtTime((tVid * 1_000_000.0).toLong(), MediaMetadataRetriever.OPTION_CLOSEST)
+                if (raw == null) continue
+                val t0 = SystemClock.elapsedRealtimeNanos()
+                val bmp = prepare(raw)
+                val dets = detector.detect(bmp)
+                val evs = pipe.process(dets, tVid, bmp.width.toDouble(), bmp.height.toDouble(), cfg.pitchDeg)
+                val ms = (SystemClock.elapsedRealtimeNanos() - t0) / 1e6
+                procMs.add(ms)
+                frames++
+                wf.write(String.format(l, "%.3f,%.1f,%d,%d\n", tVid, ms, dets.size, pipe.lastTracks.size))
+                for (d in dets) {
+                    val e = d.est
+                    val zTxt = if (e != null) String.format(l, "%.2f", e.z) else ""
+                    val bTxt = if (e != null) String.format(l, "%.1f", e.bearing) else ""
+                    val fTxt = if (e != null) e.flags.joinToString("|") else "no_range"
+                    wd.write(String.format(l, "%.3f,%s,%.2f,%.0f,%.0f,%.0f,%.0f,%s,%s,%s\n", tVid, d.label, d.conf,
+                        d.box[0], d.box[1], d.box[2], d.box[3], zTxt, bTxt, fTxt))
+                }
+                for (ev in evs) {
+                    when (ev) {
+                        is Ev.Speech -> {
+                            speech++
+                            we.write(String.format(l, "%.3f,speech,%d,%s\n", tVid, ev.pri, csvEscape(ev.text)))
+                        }
+                        is Ev.Beep -> {
+                            beeps++
+                            val desc = String.format(l, "pan=%.2f freq=%.0f", ev.pan, ev.freq)
+                            we.write(String.format(l, "%.3f,beep,,%s\n", tVid, csvEscape(desc)))
+                        }
+                        is Ev.Vibrate -> {
+                            vibes++
+                            we.write(String.format(l, "%.3f,vibrate,,\"\"\n", tVid))
+                        }
+                    }
+                }
+                if (frames % 5 == 0) onProgress(frames, total)
+            }
+        } finally {
+            try { wf.close() } catch (ignored: Exception) {}
+            try { we.close() } catch (ignored: Exception) {}
+            try { wd.close() } catch (ignored: Exception) {}
+        }
+        onProgress(frames, total)
+        val sorted = procMs.sorted()
+        val p95 = if (sorted.isEmpty()) 0.0 else sorted[(ceil(0.95 * sorted.size).toInt() - 1).coerceIn(0, sorted.size - 1)]
+        val mean = if (procMs.isEmpty()) 0.0 else procMs.average()
+        return ReplaySummary(frames, speech, beeps, vibes, mean, p95, listOf(fFrames, fEvents, fDets))
     }
 
     private fun prepare(raw: Bitmap): Bitmap {

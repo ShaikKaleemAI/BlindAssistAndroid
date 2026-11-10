@@ -26,8 +26,11 @@ class MainActivity : AppCompatActivity() {
     private val langs = listOf("en" to "English", "hi" to "हिन्दी", "te" to "తెలుగు")
 
     private val permLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) startAssist()
-        else status.text = "Camera permission is required."
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+            startAssist()
+        } else {
+            status.text = "Camera permission is required."
+        }
     }
 
     private val pickVideo = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->

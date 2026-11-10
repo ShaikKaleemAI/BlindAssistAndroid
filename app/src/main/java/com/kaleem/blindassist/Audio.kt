@@ -111,7 +111,7 @@ class Speech(ctx: Context, var lang: String) {
             current = it
             try {
                 val loc = when (it.lang) { "hi" -> Locale("hi", "IN"); "te" -> Locale("te", "IN"); else -> Locale("en", "IN") }
-                tts?.language = loc
+                tts?.setLanguage(loc)
                 latch = CountDownLatch(1)
                 tts?.speak(it.text, TextToSpeech.QUEUE_FLUSH, null, "u${it.seq}")
                 latch.await(8, TimeUnit.SECONDS)

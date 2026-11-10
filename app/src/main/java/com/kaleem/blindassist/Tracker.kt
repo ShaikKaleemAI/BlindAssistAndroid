@@ -67,7 +67,7 @@ class Track(val label: String, var box: DoubleArray, var est: RangeEst?, t: Doub
             b[0] > e && b[2] < fw - e -> b[2] - b[0]
             else -> { sizeHist.clear(); return }
         }
-        if (s > 4) { sizeHist.addLast(t to ln(s)); while (sizeHist.size > 14) sizeHist.removeFirst() }
+        if (s > 4) { sizeHist.addLast(Pair(t, ln(s))); while (sizeHist.size > 14) sizeHist.removeFirst() }
     }
 
     private fun lateralVelocity(): Double {
@@ -103,17 +103,22 @@ class Track(val label: String, var box: DoubleArray, var est: RangeEst?, t: Doub
             val k = kf
             if (k == null) kf = RangeKalman(e.z, e.sigma) else { k.predict(dt); k.update(e.z, e.sigma) }
             est = e
-            x?.let { xHist.addLast(t to it); while (xHist.size > 10) xHist.removeFirst() }
+            val cx = x
+            if (cx != null) {
+                xHist.addLast(Pair(t, cx))
+                while (xHist.size > 10) xHist.removeFirst()
+            }
             vx = lateralVelocity()
         }
         val tl = loomingTtc()
         var tk: Double? = null
-        kf?.let { closingSpeed = -it.v; if (closingSpeed > 0.25 && it.z > 0) tk = it.z / closingSpeed }
-        ttc = when {
-            tl != null && tk != null -> min(tl, tk!!)
-            tl != null -> tl
-            else -> tk
+        val filter = kf
+        if (filter != null) {
+            closingSpeed = -filter.v
+            if (closingSpeed > 0.25 && filter.z > 0) tk = filter.z / closingSpeed
         }
+        val tkv = tk
+        ttc = if (tl != null && tkv != null) min(tl, tkv) else (tl ?: tkv)
     }
 
     companion object { var nextId = 0 }

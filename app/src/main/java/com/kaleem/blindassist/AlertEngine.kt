@@ -77,7 +77,14 @@ class AlertEngine(var lang: String) {
             if (lvl > Level.NONE) scored += lvl to tr
         }
         if (scored.isEmpty()) return ev
-        scored.sortWith(compareBy({ -it.first.ordinal }, { it.second.ttc ?: 99.0 }, { it.second.z ?: 99.0 }))
+        scored.sortWith(Comparator<Pair<Level, Track>> { a, b ->
+            val byLevel = b.first.ordinal.compareTo(a.first.ordinal)
+            if (byLevel != 0) byLevel
+            else {
+                val byTtc = (a.second.ttc ?: 99.0).compareTo(b.second.ttc ?: 99.0)
+                if (byTtc != 0) byTtc else (a.second.z ?: 99.0).compareTo(b.second.z ?: 99.0)
+            }
+        })
         val (topLevel, top) = scored[0]
         val guide = Avoidance.plan(all.filter { it.hits >= 2 || (it.z ?: 9.0) < 1.5 })
 

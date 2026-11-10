@@ -18,7 +18,6 @@ import android.os.SystemClock
 import android.util.Log
 import android.util.Size
 import androidx.camera.camera2.interop.Camera2CameraInfo
-import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.*
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
@@ -35,7 +34,6 @@ import kotlin.math.min
  * Runs the whole assistant on the phone, with the screen off and the phone in a pocket:
  * camera -> detector -> range fusion -> tracker -> alerts -> speech / panned beeps / vibration.
  */
-@androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
 class AssistService : LifecycleService() {
     companion object {
         const val ACTION_STOP = "com.kaleem.blindassist.STOP"
@@ -67,7 +65,7 @@ class AssistService : LifecycleService() {
     private var slowCount = 0
     private var darkSince = 0.0
     private var lastWarnT = 0.0
-    private val lang get() = Cfg.lang
+    private val lang: String get() = Cfg.lang
 
     private fun nowS() = SystemClock.elapsedRealtime() / 1000.0
 
@@ -118,40 +116,56 @@ class AssistService : LifecycleService() {
     }
 
     private fun bindCamera() {
-        val f = ProcessCameraProvider.getInstance(this)
-        f.addListener({
+        val future = ProcessCameraProvider.getInstance(this)
+        future.addListener(Runnable {
             try {
-                val provider = f.get()
-                val rs = ResolutionSelector.Builder().setResolutionStrategy(
-                    ResolutionStrategy(Size(640, 480), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)).build()
-                val analysis = ImageAnalysis.Builder().setResolutionSelector(rs)
-                    .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
-                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).build()
-                analysis.setAnalyzer(exec) { img -> analyze(img) }
-                provider.unbindAll()
-                val cam = provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, analysis)
-                readHfov(cam)?.let {
-                    Cfg.hfovDeg = it
-                    getSharedPreferences("ba", Context.MODE_PRIVATE).edit().putFloat("hfov_deg", it.toFloat()).apply()
-                }
-                logger?.writeMeta("hfov_deg=${Cfg.hfovDeg}\ncam_height_m=${Cfg.camHeightM}\nlang=${Cfg.lang}\n" +
-                    "device=${Build.MANUFACTURER} ${Build.MODEL}\nsdk=${Build.VERSION.SDK_INT}\n")
-                pipeline = Pipeline(Cam(Cfg.hfovDeg, Cfg.camHeightM, Cfg.defaultPitchDeg), Cfg.lang)
-                lastFrameT = nowS()
-            } catch (e: Exception) { Log.e("BA", "camera bind failed", e) }
+                setupCamera(future.get())
+            } catch (e: Exception) {
+                Log.e("BA", "camera bind failed", e)
+            }
         }, ContextCompat.getMainExecutor(this))
     }
 
-    /** Real horizontal field of view in PORTRAIT (uses the sensor's short side). */
-    private fun readHfov(cam: Camera): Double? = try {
-        val c2 = Camera2CameraInfo.from(cam.cameraInfo)
-        val fl = c2.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull()
-        val sz = c2.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
-        if (fl != null && sz != null) {
-            val d = Math.toDegrees(2 * atan(min(sz.width, sz.height) / (2.0 * fl)))
-            if (d in 30.0..90.0) d else null
-        } else null
-    } catch (e: Exception) { null }
+    private fun setupCamera(provider: ProcessCameraProvider) {
+        val rs = ResolutionSelector.Builder()
+            .setResolutionStrategy(
+                ResolutionStrategy(Size(640, 480), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER))
+            .build()
+        val analysis = ImageAnalysis.Builder()
+            .setResolutionSelector(rs)
+            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+            .build()
+        analysis.setAnalyzer(exec, ImageAnalysis.Analyzer { img -> analyze(img) })
+        provider.unbindAll()
+        val camera = provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, analysis)
+        val hfov = readHfov(camera)
+        if (hfov != null) {
+            Cfg.hfovDeg = hfov
+            getSharedPreferences("ba", Context.MODE_PRIVATE).edit().putFloat("hfov_deg", hfov.toFloat()).apply()
+        }
+        logger?.writeMeta(
+            "hfov_deg=${Cfg.hfovDeg}\ncam_height_m=${Cfg.camHeightM}\nlang=${Cfg.lang}\n" +
+                "device=${Build.MANUFACTURER} ${Build.MODEL}\nsdk=${Build.VERSION.SDK_INT}\n")
+        pipeline = Pipeline(Cam(Cfg.hfovDeg, Cfg.camHeightM, Cfg.defaultPitchDeg), Cfg.lang)
+        lastFrameT = nowS()
+    }
+
+    /** Real horizontal field of view in PORTRAIT (uses the sensor's short side). Null if the phone will not say. */
+    private fun readHfov(camera: Camera): Double? {
+        try {
+            val info = Camera2CameraInfo.from(camera.cameraInfo)
+            val focals = info.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+            val size = info.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+            if (focals == null || focals.isEmpty() || size == null) return null
+            val focal = focals[0].toDouble()
+            val shortSide = min(size.width, size.height).toDouble()
+            val deg = Math.toDegrees(2.0 * atan(shortSide / (2.0 * focal)))
+            return if (deg >= 30.0 && deg <= 90.0) deg else null
+        } catch (e: Exception) {
+            return null
+        }
+    }
 
     private fun analyze(img: ImageProxy) {
         try {
@@ -161,10 +175,11 @@ class AssistService : LifecycleService() {
             val n0 = SystemClock.elapsedRealtimeNanos()
             val now = n0 / 1e9                       // same time base as nowS()
             // Capture->analyzer delay: only meaningful if the camera timestamps are on the realtime clock (unverified per device).
-            val capMs = ((n0 - img.imageInfo.timestamp) / 1e6).let { if (it in 0.0..2000.0) it else Double.NaN }
+            val capRaw = (n0 - img.imageInfo.timestamp) / 1e6
+            val capMs = if (capRaw >= 0.0 && capRaw <= 2000.0) capRaw else Double.NaN
             lastFrameT = now
             val pitch = sen.pitchDeg()
-            val rot = img.imageInfo.rotationDegrees + if (sen.upsideDown()) 180 else 0
+            val rot = (img.imageInfo.rotationDegrees + (if (sen.upsideDown()) 180 else 0)) % 360
             val raw = img.toBitmap()
             val up = Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height, Matrix().apply { postRotate(rot.toFloat()) }, true)
             checkHealth(up, now, pitch)
@@ -178,7 +193,8 @@ class AssistService : LifecycleService() {
             lastDecodeMs = (n1 - n0) / 1e6; lastDetectMs = (n2 - n1) / 1e6; lastPipeMs = (n3 - n2) / 1e6; lastCapMs = capMs
             val ms = (n4 - n0) / 1e6
             // Latency = capture->alert-dispatched when the capture delay is known, else analyzer time only. Excludes TTS/audio start.
-            stats.record(now, ms + if (capMs.isNaN()) 0.0 else capMs)
+            val capExtra = if (capMs.isNaN()) 0.0 else capMs
+            stats.record(now, ms + capExtra)
             slowCount = if (ms > 450) slowCount + 1 else 0
             if (slowCount == 5 && now >= armedAt) speech?.say(I18n.t(lang, "slow"), P_ANSWER, 5.0, "slow")
         } catch (e: Throwable) { Log.e("BA", "analyze", e) } finally { img.close() }
@@ -198,10 +214,12 @@ class AssistService : LifecycleService() {
 
     private fun dispatch(evs: List<Ev>, now: Double) {
         if (now < armedAt) return
-        for (e in evs) when (e) {
-            is Ev.Speech -> speech?.say(e.text, e.pri, e.ttl, e.key)
-            is Ev.Beep -> earcons?.beep(e.pan, e.freq, e.dur)
-            Ev.Vibrate -> vibrateOnce(this)
+        for (e in evs) {
+            when (e) {
+                is Ev.Speech -> { speech?.say(e.text, e.pri, e.ttl, e.key) }
+                is Ev.Beep -> { earcons?.beep(e.pan, e.freq, e.dur) }
+                is Ev.Vibrate -> { vibrateOnce(this) }
+            }
         }
     }
 
@@ -237,12 +255,12 @@ class AssistService : LifecycleService() {
     private fun setupSession() {
         val s = MediaSession(this, "BlindAssist")
         s.setCallback(object : MediaSession.Callback() {
-            override fun onPlay() = summarize()
-            override fun onPause() = summarize()
+            override fun onPlay() { summarize() }
+            override fun onPause() { summarize() }
         })
         s.setPlaybackState(PlaybackState.Builder()
             .setActions(PlaybackState.ACTION_PLAY or PlaybackState.ACTION_PAUSE or PlaybackState.ACTION_PLAY_PAUSE)
-            .setState(PlaybackState.STATE_PLAYING, 0, 1f).build())
+            .setState(PlaybackState.STATE_PLAYING, 0L, 1f).build())
         s.isActive = true
         session = s
     }
